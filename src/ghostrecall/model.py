@@ -11,11 +11,18 @@ SOURCE_TYPES = ("decision", "note", "doc", "commit", "session_note")
 
 @dataclass
 class Provenance:
+    """Where an item came from: source file + line, or a git commit.
+
+    ``date`` is the date recorded at the source (decision heading,
+    note, or commit); it is never invented when the source has none.
+    """
     path: str            # project-relative path, or "git:<short-hash>"
     line: int | None = None
     commit: str | None = None
     date: str | None = None
     def is_valid(self) -> bool:
+        """True when this provenance is enough to export the item:
+        a commit hash, or a path with a 1-based line number."""
         if self.commit:
             return True
         return bool(self.path) and self.line is not None and self.line >= 1
@@ -23,6 +30,8 @@ class Provenance:
 
 @dataclass
 class Item:
+    """One recallable memory item: a decision record, a note section,
+    a doc section, a changelog entry, or a git commit message."""
     id: str
     title: str
     text: str
@@ -36,6 +45,8 @@ class Item:
     secret_findings: list[dict] = field(default_factory=list)
     @property
     def blocked(self) -> bool:
+        """True when the secrets guard flagged this item; blocked items
+        are excluded from export and recorded with the reason."""
         return bool(self.secret_findings)
     @property
     def date(self) -> str | None:

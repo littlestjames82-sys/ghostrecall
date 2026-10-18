@@ -23,6 +23,12 @@ DEFAULTS = {
 MODES = ("full", "decision-only", "headings", "recent", "exclude")
 
 def load_profile(project: Path) -> dict:
+    """Return the recall profile for *project*: DEFAULTS overlaid with
+    the ``recall`` section of its ``.ghostslice.json`` (if that file
+    exists). Raises ValueError naming the problem for a malformed file,
+    an unknown recall key, a bad default_mode, or a
+    memory_budget_fraction outside (0, 1].
+    """
     cfg = dict(DEFAULTS)
     pf = Path(project) / ".ghostslice.json"
     if not pf.exists():
@@ -44,6 +50,20 @@ def load_profile(project: Path) -> dict:
     if cfg["default_mode"] not in MODES:
         raise ValueError(f"invalid profile: recall.default_mode {cfg['default_mode']!r} not in {MODES}")
     frac = cfg["memory_budget_fraction"]
-    if not isinstance(frac, (int, float)) or not (0 < float(frac) <= 1):
+    if isinstance(frac, bool) or not isinstance(frac, (int, float)) or not (0 < float(frac) <= 1):
         raise ValueError("invalid profile: recall.memory_budget_fraction must be in (0, 1]")
+    # Type/range checks for the remaining keys, same fail-loudly rule:
+    # a wrong-typed value used to surface much later as a confusing
+    # int() crash in selection, or worse, silently misbehave (a
+    # negative recent_n slicing off the wrong end, a bare-string
+    # pinned_rules being iterated character by character).
+    for key, minimum in (("recent_n", 1), ("max_items", 1), ("git_limit", 0)):
+        v = cfg[key]
+        if isinstance(v, bool) or not isinstance(v, int) or v < minimum:
+            raise ValueError(f"invalid profile: recall.{key} must be an integer >= {minimum}, got {v!r}")
+    if not isinstance(cfg["include_git"], bool):
+        raise ValueError(f"invalid profile: recall.include_git must be true or false, got {cfg['include_git']!r}")
+    pins = cfg["pinned_rules"]
+    if not isinstance(pins, list) or not all(isinstance(x, str) for x in pins):
+        raise ValueError("invalid profile: recall.pinned_rules must be a list of strings")
     return cfg

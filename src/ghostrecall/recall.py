@@ -3,6 +3,7 @@ from __future__ import annotations
 import math, re
 from collections import Counter, defaultdict
 
+from .conflicts import detect_contradictions
 from .tokens import estimate
 
 _WORD = re.compile(r"[a-z0-9_]+")
@@ -11,6 +12,12 @@ def _terms(text: str) -> list[str]:
     return _WORD.findall((text or "").lower())
 
 def tfidf_rank(items, task: str) -> list[tuple[object, float]]:
+    """Rank *items* against *task* by TF-IDF over title + text.
+
+    Returns ``(item, score)`` pairs, best first, ties broken by item
+    id so the order is deterministic. Keyword matching only: a
+    paraphrase with no shared words scores 0.
+    """
     docs = [_terms(it.title + " " + it.text) for it in items]
     n = len(docs)
     df: Counter = Counter()
@@ -47,6 +54,11 @@ def _real_supersedes(item) -> str | None:
     return None if v.lower() in _NONE_REFS else v
 
 def is_pinned(item, profile: dict) -> bool:
+    """True when *item* is a standing rule: a decision tagged rule /
+    pinned / standing, or an item whose title or id is listed in the
+    profile's ``pinned_rules``. Note select() checks supersession
+    before pinning, so a superseded rule is never pinned into a
+    selection even when this returns True for it."""
     if item.source_type == "decision" and any(
             t in item.tags for t in ("rule", "pinned", "standing-rule", "standing")):
         return True
@@ -63,11 +75,18 @@ def select(items, task: str = "", profile: dict | None = None,
     alike) unconditionally. They go to not_selected with reason
     superseded, so bundle export records them only as
     excluded/superseded in the manifest (REPORT_B F1).
+    The same precedence applies to secret-blocked items: a finding
+    blocks the item even when it is a pinned standing rule, so no
+    selected item ever carries secret text to a preview surface.
     A conflict is recorded when a selected decision supersedes one that
     is also in the corpus (the older text is flagged, not hidden).
     """
     profile = profile or {}
     limit = max_items if max_items is not None else int(profile.get("max_items", 50))
+    if limit < 1:
+        # Callers that bypass load_profile validation must not get
+        # silent nonsense from a zero/negative limit either.
+        raise ValueError(f"max_items must be >= 1, got {limit!r}")
     ranked = tfidf_rank(items, task) if task else [(it, 0.0) for it in items]
     score_of = {id(it): s for it, s in ranked}
     selected, not_selected, conflicts = [], [], []
@@ -75,6 +94,10 @@ def select(items, task: str = "", profile: dict | None = None,
     pool = list(items)
     if mode == "recent":
         n = int(profile.get("recent_n", 5))
+        if n < 1:
+            # dated[:-1] would silently drop the oldest item instead
+            # of meaning "last -1"; reject it like the profile does.
+            raise ValueError(f"recent_n must be >= 1, got {n!r}")
         dated = sorted([i for i in pool if i.date], key=lambda i: i.date, reverse=True)
         pool = dated[:n] + [i for i in pool if not i.date][:0]
     selected_ids = set()
@@ -84,6 +107,14 @@ def select(items, task: str = "", profile: dict | None = None,
             # a superseded standing rule is still superseded.
             not_selected.append({"item": it, "reason": "superseded",
                                  "superseded_by": it.superseded_by})
+            continue
+        if it.blocked:
+            # Secrets block BEFORE pinning too: a pinned rule carrying
+            # a secret finding must never be selected, or its text
+            # leaks through surfaces that preview selected items
+            # (MCP recall_search text_preview, dashboard, bundle).
+            not_selected.append({"item": it, "reason": "secret-finding (blocked)",
+                                 "findings": it.secret_findings})
             continue
         pinned = is_pinned(it, profile)
         entry = {"item": it, "score": score_of.get(id(it), 0.0), "pinned": pinned}
@@ -121,6 +152,11 @@ def select(items, task: str = "", profile: dict | None = None,
             })
         # No pinned-superseded conflict branch: superseded items are
         # never in `selected` any more (see the pool loop above).
+    # Unresolved contradictions between the active decisions that ARE
+    # being served: flagged alongside the supersedes conflicts, never
+    # resolved here - both decisions stay selected (conflicts.py).
+    conflicts.extend(detect_contradictions(
+        e["item"] for e in selected))
     # order: pinned first, then score desc
     selected.sort(key=lambda e: (not e["pinned"], -e["score"], e["item"].id))
     for e in selected:
@@ -128,6 +164,13 @@ def select(items, task: str = "", profile: dict | None = None,
     return selected, not_selected, conflicts
 
 def explain(items, task: str, item_key: str, profile: dict | None = None) -> dict:
+    """Explain one item for *task* as a JSON-friendly dict.
+
+    *item_key* matches an item id, exact title, or source path. The
+    result says whether the item was selected and why (pinned rule,
+    ranked, superseded, blocked, not ranked, ...), or that no such
+    item exists in the project sources.
+    """
     selected, not_selected, _c = select(items, task, profile or {})
     for coll, was in ((selected, True),):
         for e in coll:

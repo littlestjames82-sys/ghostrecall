@@ -33,6 +33,11 @@ TOOLS = [
 ]
 
 def _call(name: str, args: dict):
+    """Dispatch one MCP tool call and return its JSON-friendly result.
+
+    Raises ValueError for an unknown tool name; serve() turns that
+    into a JSON-RPC error instead of crashing.
+    """
     if name == "recall_search":
         root = assert_project_root(args["project"])
         profile = load_profile(root)
@@ -41,6 +46,8 @@ def _call(name: str, args: dict):
         selected, not_selected, conflicts = select(items, args["task"], profile)
         out = []
         for e in selected[:MAX_RESULTS]:
+            if e["item"].blocked:
+                continue  # defence in depth: never preview secret-bearing text
             d = e["item"].to_dict(include_text=False)
             d["score"] = e["score"]; d["pinned"] = e["pinned"]
             d["tokens_estimate"] = estimate(e["item"].text)
@@ -62,6 +69,11 @@ def _call(name: str, args: dict):
     raise ValueError(f"unknown tool: {name}")
 
 def serve(stdin=None, stdout=None) -> int:
+    """Serve JSON-RPC requests, one per line, until stdin closes.
+
+    Handles initialize, tools/list and tools/call; notifications are
+    ignored. Returns 0.
+    """
     stdin = stdin or sys.stdin
     stdout = stdout or sys.stdout
     for line in stdin:

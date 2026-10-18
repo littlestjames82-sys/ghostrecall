@@ -10,6 +10,14 @@ from __future__ import annotations
 import re
 
 def slice_item(item, mode: str) -> str:
+    """Return *item*'s text sliced to *mode* (see the table in README.md).
+
+    Extractive only: the result is built from the item's own lines
+    (``decision-only`` keeps the decision line and prefixes its date),
+    never newly written prose. ``recent`` slices like ``full`` here
+    because the last-N cut happens at selection time. Raises
+    ValueError for an unknown mode.
+    """
     if mode == "exclude":
         return ""
     if mode in ("full", "recent"):

@@ -8,6 +8,12 @@ import html
 from .tokens import estimate
 
 def render_panel(selected, not_selected, total_tokens: int = 0) -> str:
+    """Render the dashboard panel HTML fragment for a selection.
+
+    *selected* and *not_selected* are the lists returned by
+    recall.select(); *total_tokens* is the combined estimated total
+    shown in the header. All item text is HTML-escaped.
+    """
     rows = []
     for e in selected:
         it = e["item"]

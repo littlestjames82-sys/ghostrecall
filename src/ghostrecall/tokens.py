@@ -10,6 +10,8 @@ METHOD_VERSION = 2
 PROSE_FACTOR = 0.85
 
 def estimate(text: str) -> int:
+    """Estimated token count for *text* (see METHOD; an estimate, not
+    an exact tokenizer count). Empty text estimates to 0."""
     if not text:
         return 0
     raw = 0
@@ -19,5 +21,6 @@ def estimate(text: str) -> int:
     return max(1, round(raw * PROSE_FACTOR)) if raw else 0
 
 def sha256_text(text: str) -> str:
+    """Hex sha256 of *text* as UTF-8, the digest recorded in manifests."""
     import hashlib
     return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()

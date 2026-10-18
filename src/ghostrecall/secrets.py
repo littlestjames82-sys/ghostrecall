@@ -25,14 +25,25 @@ class Finding:
     def to_dict(self): return {"path": self.path, "line": self.line, "type": self.type}
 
 def scan_text(text: str, path: str) -> list[Finding]:
+    """Scan *text* line by line and return one Finding per flagged line.
+
+    *path* is the label recorded on each finding (a project-relative
+    path or ``git:<short-hash>``). Lines mentioning a placeholder word
+    (example, dummy, redacted, ...) are exempt, matching GhostSlice.
+    """
     out: list[Finding] = []
     for i, line in enumerate(text.splitlines(), 1):
-        low = line.lower()
         for name, pat in _PATTERNS:
             m = pat.search(line)
             if not m:
                 continue
-            if any(p in low for p in _PLACEHOLDERS):
+            # Placeholder exemption is scoped to the MATCHED secret
+            # itself (e.g. a value literally containing "example" or
+            # "changeme"). Checking the whole line let any real secret
+            # through whenever a placeholder word appeared anywhere
+            # on the line, e.g. a trailing "# example" comment or an
+            # appended "fake".
+            if any(p in m.group(0).lower() for p in _PLACEHOLDERS):
                 continue
             out.append(Finding(path, i, name))
             break

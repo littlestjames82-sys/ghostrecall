@@ -26,13 +26,21 @@ def _forbidden_roots() -> list[Path]:
             (home / ".MEMORY.md").resolve()]
 
 def assert_project_root(project) -> Path:
+    """Resolve *project* and enforce the project-local boundary.
+
+    Raises ValueError when the path is not a directory, is the user's
+    home directory, or is (inside) the assistant's private memory.
+    """
     root = Path(project).expanduser().resolve()
     if not root.is_dir():
         raise ValueError(f"project not a directory: {project}")
     for forb in _forbidden_roots():
-        if root == forb or forb == root or str(root) == str(forb):
+        # Refuse a root that IS a forbidden location, sits INSIDE one
+        # (forb in root.parents), or CONTAINS one (root in
+        # forb.parents): the last case covers the home dir itself,
+        # which would sweep private memory in.
+        if root == forb or forb in root.parents or root in forb.parents:
             raise ValueError(f"refusing private assistant memory as a project source: {root}")
-        # A root that is the home dir itself would sweep private memory in.
         if root == Path.home().resolve():
             raise ValueError("refusing home directory as a project source (private memory boundary)")
     return root
@@ -94,8 +102,18 @@ def _parse_decision_block(block: str, start_line: int, rel: str, heading: str) -
     tags = [t.strip().lower() for t in re.split(r"[,;]", fields.get("tags", "")) if t.strip()]
     if fields.get("rule", "").lower() in ("true", "yes", "standing", "pinned"):
         tags.append("rule")
-    status = fields.get("status", "active").lower()
-    if status not in ("active", "superseded"):
+    status = fields.get("status", "active").lower().strip().strip(".;")
+    # Anything that is plainly no longer in force must not be served
+    # as current: common lifecycle words (and a trailing-punctuation
+    # typo like "superseded.") all map to superseded. "current" is
+    # the documented synonym for active; unknown words stay active
+    # for back-compat rather than silently dropping a live rule.
+    if status in ("superseded", "replaced", "archived", "withdrawn",
+                  "deprecated", "revoked", "obsolete", "retired", "inactive"):
+        status = "superseded"
+    elif status not in ("active", "current"):
+        status = "active"
+    if status == "current":
         status = "active"
     item = Item(
         id="decision-" + _slug(title),
@@ -143,6 +161,21 @@ def parse_decisions(text: str, rel: str) -> list[Item]:
         # Single-decision file with fields but no ## heading.
         if _FIELD_RE.search(text) and ("decision" in text.lower()):
             items.append(_parse_decision_block(text, 1, rel, rel))
+    # Identical headings would produce identical item ids, which
+    # breaks id-keyed bookkeeping downstream (selection sets,
+    # explain lookups, manifest audits). Disambiguate with the
+    # record's start line, which is unique within the file.
+    seen_ids: dict[str, int] = {}
+    for it in items:
+        if it.id in seen_ids:
+            seen_ids[it.id] += 1
+            suffix = it.provenance.line or seen_ids[it.id]
+            it.id = f"{it.id}-{suffix}"
+            if seen_ids.get(it.id):
+                it.id = f"{it.id}-{seen_ids[it.id]}"
+            seen_ids[it.id] = 1
+        else:
+            seen_ids[it.id] = 1
     # A record with no date still has file+line provenance, which the
     # plan requires; date stays None rather than being invented.
     return items
@@ -177,10 +210,25 @@ def _classify(rel_path: Path) -> str:
     return "note"
 
 def collect_items(project, include_git: bool = True, git_limit: int = 200) -> list[Item]:
+    """Collect every recallable item inside *project*.
+
+    Walks Markdown/text sources (DECISIONS.md parsed into records,
+    other files split into sections), skips ignored and oversized
+    files, never follows a path outside the root, scans each item
+    with the secrets guard, optionally appends local git history,
+    and resolves superseded links between decisions before returning.
+    """
     root = assert_project_root(project)
     items: list[Item] = []
     for path in sorted(root.rglob("*")):
-        if any(part in IGNORE_DIRS for part in path.parts):
+        try:
+            rel_parts = path.relative_to(root).parts
+        except ValueError:
+            continue
+        # Ignore dirs are matched on the PROJECT-RELATIVE path only:
+        # matching the absolute path would silently empty any project
+        # that happens to live under an ancestor named e.g. "build".
+        if any(part in IGNORE_DIRS for part in rel_parts):
             continue
         if not path.is_file() or path.suffix.lower() not in TEXT_EXTS:
             continue

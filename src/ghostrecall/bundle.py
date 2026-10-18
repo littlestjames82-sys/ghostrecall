@@ -35,13 +35,23 @@ def _load_slice_bundle(slice_bundle):
     mf = sb / "manifest.json"
     if not mf.exists():
         raise ValueError(f"slice bundle has no manifest.json: {slice_bundle}")
-    data = json.loads(mf.read_text(encoding="utf-8"))
+    try:
+        data = json.loads(mf.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        raise ValueError(f"slice bundle manifest unreadable: {slice_bundle}: {e}") from e
+    if not isinstance(data, dict):
+        raise ValueError(f"slice bundle manifest must be a JSON object: {slice_bundle}")
+    files = data.get("files", [])
+    if not isinstance(files, list):
+        raise ValueError(f"slice bundle manifest 'files' must be a list: {slice_bundle}")
     prompt = ""
     pp = sb / "PROMPT.md"
     if pp.exists():
         prompt = pp.read_text(encoding="utf-8", errors="replace")
     code_items = []
-    for f in data.get("files", []) if isinstance(data, dict) else []:
+    for f in files:
+        if not isinstance(f, dict):
+            raise ValueError(f"slice bundle manifest file entry must be an object: {slice_bundle}")
         code_items.append({
             "id": "code-" + str(f.get("path", "")),
             "source_type": "code",
@@ -57,7 +67,24 @@ def _load_slice_bundle(slice_bundle):
 
 def build_bundle(project, out, task: str = "", fit: int | None = None,
                  slice_bundle=None, mode: str | None = None) -> dict:
+    """Build a bundle for *project* in *out* and return its manifest dict.
+
+    Writes manifest.json, PROMPT.md, RECALL.md and the sliced items
+    under ``files/`` (plus slice_manifest.json when *slice_bundle* is
+    given). With *fit*, memory first downgrades to decision-only and
+    then drops lowest-ranked non-pinned items; pinned rules are kept
+    even if the budget is exceeded. Blocked and superseded items are
+    recorded as excluded, never written as content. Also appends one
+    line to the project's .ghostrecall-history.jsonl ledger.
+    """
     from .sources import assert_project_root
+    if fit is not None:
+        # fit=0 used to be silently ignored and a negative fit silently
+        # dropped everything; a budget must be a positive token count.
+        if isinstance(fit, bool) or not isinstance(fit, (int, float)) \
+                or int(fit) != fit or fit <= 0:
+            raise ValueError(f"fit must be a positive token budget, got {fit!r}")
+        fit = int(fit)
     root = assert_project_root(project)
     profile = load_profile(root)
     mode = mode or profile.get("default_mode", "full")
@@ -192,7 +219,13 @@ def build_bundle(project, out, task: str = "", fit: int | None = None,
     if conflicts:
         report.append("\n## Conflicts / superseded\n")
         for c in conflicts:
-            report.append(f"- {c['type']}: {c.get('current', '')} supersedes/relates {c.get('superseded', '')}. {c['note']}")
+            if c.get("type") == "possible-contradiction":
+                report.append(f"- {c['type']}: {c.get('current', '')} vs "
+                              f"{c.get('other', '')} (signal: {c.get('signal', '')}, "
+                              f"shared terms: {', '.join(c.get('shared_terms', []))}, "
+                              f"opposing terms: {', '.join(c.get('opposing_terms', []))}). {c['note']}")
+            else:
+                report.append(f"- {c['type']}: {c.get('current', '')} supersedes/relates {c.get('superseded', '')}. {c['note']}")
     (out_path / "RECALL.md").write_text("\n".join(report) + "\n", encoding="utf-8")
 
     _append_ledger(root, manifest)
@@ -210,6 +243,13 @@ def _append_ledger(root: Path, manifest: dict) -> None:
         pass
 
 def check_bundle(bundle) -> tuple[bool, list[str]]:
+    """Verify the bundle folder at *bundle* against its manifest.json.
+
+    Returns ``(ok, problems)``: ok is True only when every exported
+    file is present with a matching sha256 and estimated token count,
+    every item carries provenance, and PROMPT.md matches the recorded
+    prompt hash and token estimate.
+    """
     b = Path(bundle)
     problems: list[str] = []
     mf = b / "manifest.json"
@@ -219,25 +259,40 @@ def check_bundle(bundle) -> tuple[bool, list[str]]:
         data = json.loads(mf.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as e:
         return False, [f"manifest unreadable: {e}"]
-    for item in data.get("items", []):
+    if not isinstance(data, dict):
+        return False, ["manifest is not a JSON object"]
+    raw_items = data.get("items", [])
+    if not isinstance(raw_items, list):
+        return False, ["manifest 'items' is not a list"]
+    for item in raw_items:
+        if not isinstance(item, dict):
+            problems.append(f"manifest item is not an object: {item!r}")
+            continue
         ef = item.get("exported_file")
         if not ef:
             continue  # code items live in the referenced Slice bundle
         p = b / ef
-        if not p.exists():
+        if not p.is_file():
             problems.append(f"missing exported file: {ef}")
             continue
-        text = p.read_text(encoding="utf-8", errors="replace")
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            problems.append(f"unreadable exported file: {ef}: {e}")
+            continue
         if hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest() != item.get("sha256"):
             problems.append(f"sha256 mismatch: {ef}")
         if estimate(text) != item.get("sliced_tokens"):
             problems.append(f"token total mismatch: {ef} "
                             f"(manifest {item.get('sliced_tokens')}, actual {estimate(text)})")
         prov = item.get("provenance") or {}
+        if not isinstance(prov, dict):
+            problems.append(f"provenance missing: {item.get('id')}")
+            prov = {}
         if not (prov.get("commit") or (prov.get("path") and prov.get("line"))):
             problems.append(f"provenance missing: {item.get('id')}")
     prompt_path = b / "PROMPT.md"
-    if not prompt_path.exists():
+    if not prompt_path.is_file():
         problems.append("PROMPT.md missing")
     else:
         # F4: PROMPT.md is bundle content, not a bystander. Verify it
@@ -246,11 +301,16 @@ def check_bundle(bundle) -> tuple[bool, list[str]]:
         # totals.prompt_tokens_estimate (present in manifests written
         # before prompt_sha256 existed, so tampering with an older
         # bundle is caught too).
-        prompt_text = prompt_path.read_text(encoding="utf-8", errors="replace")
+        try:
+            prompt_text = prompt_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            problems.append(f"PROMPT.md unreadable: {e}")
+            return (not problems), problems
         recorded_sha = data.get("prompt_sha256")
         if recorded_sha and sha256_text(prompt_text) != recorded_sha:
             problems.append("sha256 mismatch: PROMPT.md")
-        expected_tokens = (data.get("totals") or {}).get("prompt_tokens_estimate")
+        totals = data.get("totals")
+        expected_tokens = totals.get("prompt_tokens_estimate") if isinstance(totals, dict) else None
         if expected_tokens is not None and estimate(prompt_text) != expected_tokens:
             problems.append(f"token total mismatch: PROMPT.md "
                             f"(manifest {expected_tokens}, actual {estimate(prompt_text)})")
