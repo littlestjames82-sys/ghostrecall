@@ -1,5 +1,6 @@
 # GhostRecall
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![CI](https://github.com/littlestjames82-sys/ghostrecall/actions/workflows/ci.yml/badge.svg)](https://github.com/littlestjames82-sys/ghostrecall/actions/workflows/ci.yml/actions)
 
 **Give your agent the project's memory, sliced like its code.**
 
